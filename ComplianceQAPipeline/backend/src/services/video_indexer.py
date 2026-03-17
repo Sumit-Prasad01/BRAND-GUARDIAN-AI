@@ -74,10 +74,16 @@ class VideoIndexer:
         logger.info(f"Downloading Youtube Video : {url}")
 
         ydl_opts = {
-            'format' : 'best[ext=mp4]',
+            'format' : 'best',
             'outtmpl' : output_path,
-            'quiet' : True,
-            'overwrites' : True
+            'quiet' : False,
+            'no_warnings' : False,
+            'extraction_args' : {
+                'youtube' : {
+                    'player_client' : ['android', 'web']
+                }
+            },
+            'User-Agent' : 'Mozilla/5.0 (Windows NT 10.0; Win64; 64) AppleWebKit/537.36'
         }
 
         try:

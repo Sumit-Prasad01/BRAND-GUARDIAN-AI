@@ -1,5 +1,11 @@
 '''
-Main execution entry point for the Compliance QA Pipeline.
+Main execution entry point for Brand guardian AI.
+
+This file is the "control center" that starts and manages the entire compliance 
+audit workflow. Think of it as the master switch that :
+1. Sets up the audit request
+2. Runs the AI workflow
+3. Displays the final compliance report 
 '''
 
 import uuid
@@ -21,7 +27,13 @@ logger = logging.getLogger("brand-guardian-runner")
 
 def run_cli_simulation():
     '''
-    Simulates the video compliance audit request
+    Simulates a Video Coompliance Audit request.
+
+    This function orchestrates the entire audit process:
+    - Create a unique session ID
+    - Prepares the video URL metadata
+    - Runs it through the AI workflows
+    - Displays the compliance results
     '''
 
     # generate the session ID
