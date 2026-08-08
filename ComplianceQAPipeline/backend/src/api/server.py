@@ -1,5 +1,6 @@
 import uuid
 import logging
+import uvicorn
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -101,3 +102,7 @@ def health_check():
         "status" : "healthy",
         "service" : "Brand Guardian AI"
     }
+
+
+if __name__ == "__main__":
+    uvicorn.run("backend.src.api.server:app", host = "127.0.0.1", port = 8000, reload = True)
