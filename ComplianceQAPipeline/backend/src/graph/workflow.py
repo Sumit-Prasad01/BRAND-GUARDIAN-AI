@@ -1,44 +1,59 @@
-'''
-This module defines the DAG : Direct Acyclic Graph that orchestrates the video compliance audit process.
-It connects the nodes using the StateGraph from Langgraph
-START -> index_video_node -> audit_content_node -> END
-'''
+"""
+Workflow Definition for the Brand Guardian AI.
+
+This module defines the Directed Acyclic Graph (DAG) that orchestrates the
+video compliance audit process. It connects the nodes (functional units)
+using the StateGraph primitive from LangGraph.
+
+Architecture:
+    [START] -> [index_video_node] -> [audit_content_node] -> [END]
+"""
 
 from langgraph.graph import StateGraph, END
 
-from backend.src.graph.state import VideoAuditedState
-from backend.src.graph.node import (
+# Import the State Schema
+from backend.src.graph.state import VideoAuditState
+
+# Import the Functional Nodes
+from backend.src.graph.nodes import (
     index_video_node,
-    audio_content_node
+    audit_content_node
 )
 
 def create_graph():
-    '''
-    Constructs and compiles the LangGraph workflow
-    Returns : 
-    Complied Graph : runnable garph object for execution
-    '''
+    """
+    Constructs and compiles the LangGraph workflow.
 
-    # initializes the graph with state schema
-    workflow = StateGraph(VideoAuditedState)
+    Returns:
+        CompiledGraph: A runnable graph object ready for execution.
+    """
+    # 1. Initialize the Graph with the State Schema
+    # This ensures all nodes adhere to the 'VideoAuditState' data structure.
+    workflow = StateGraph(VideoAuditState)
 
-    # add nodes
+    # 2. Add Nodes (The Workers)
+    # The first argument is the unique name of the node in the graph.
+    # The second argument is the function to execute.
     workflow.add_node("indexer", index_video_node)
-    workflow.add_node("auditor", audio_content_node)
+    workflow.add_node("auditor", audit_content_node)
 
-    # define the entry point : indexer
-    # define the edges
+    # 3. Define Edges (The Logic Flow)
+    # Define the entry point: When the graph starts, go to 'indexer'.
     workflow.set_entry_point("indexer")
 
-    #define the edges
+    # Connect 'indexer' -> 'auditor'
+    # Once the video is indexed (transcript extracted), move to compliance auditing.
     workflow.add_edge("indexer", "auditor")
 
-    # once the audit is complete, the workflow ends
+    # Connect 'auditor' -> END
+    # Once the audit is complete, the workflow finishes.
     workflow.add_edge("auditor", END)
 
-    # compile the graph
+    # 4. Compile the Graph
+    # This validates the connections and creates the executable runnable.
     app = workflow.compile()
+
     return app
 
-# expose this runnable app
+# Expose the runnable app for import by the API or CLI
 app = create_graph()

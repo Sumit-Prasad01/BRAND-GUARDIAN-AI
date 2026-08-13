@@ -1,108 +1,234 @@
-import uuid
-import logging
-import uvicorn
+import uuid        
+import logging     
+from fastapi import FastAPI, HTTPException  
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel  
 
+from typing import List, Optional  
+
+# ========== STEP 1: LOAD ENVIRONMENT VARIABLES ==========
+# CRITICAL: Must happen BEFORE importing modules that need env vars
 from dotenv import load_dotenv
-load_dotenv(override = True)
+load_dotenv(override=True)  
+# Reads .env file and sets environment variables
+# override=True = .env values replace system environment variables
+# Example .env contents:
+#   AZURE_SEARCH_KEY=abc123
+#   APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=...
 
-# initialize the telemetry
+
+# ========== STEP 2: INITIALIZE TELEMETRY ==========
 from backend.src.api.telemetry import setup_telemetry
-setup_telemetry()
+setup_telemetry()  
+# ☝️ "Activates the sensors" - starts tracking all API activity
+# Must happen AFTER load_dotenv() but BEFORE creating FastAPI app
 
+
+# ========== STEP 3: IMPORT WORKFLOW GRAPH ==========
 from backend.src.graph.workflow import app as compliance_graph
+# Imports your LangGraph workflow (Indexer → Auditor)
+# Renamed to 'compliance_graph' to avoid confusion with FastAPI's 'app'
 
-logging.basicConfig(
-    level =logging.INFO
-)
 
-logger = logging.getLogger("api-server")
+# ========== STEP 4: CONFIGURE LOGGING ==========
+logging.basicConfig(level=logging.INFO)  
+# Sets default log level (INFO = important events, not debug spam)
 
-# fastapi app
+logger = logging.getLogger("api-server")  
+# Creates named logger for this module
+
+
+# ========== STEP 5: CREATE FASTAPI APPLICATION ==========
 app = FastAPI(
-    title = "Brand Guardian AI API",
-    description = "API for auditing video content against the brand compliance rules.",
-    version = "1.0.0"
-    )
+    # Metadata for auto-generated API documentation (Swagger UI)
+    title="Brand Guardian AI API",
+    description="API for auditing video content against brand compliance rules.",
+    version="1.0.0"
+)
+# FastAPI automatically creates:
+# - Interactive docs at http://localhost:8000/docs
+# - OpenAPI schema at http://localhost:8000/openapi.json
 
-# define data models
+
+# ========== STEP 6: DEFINE DATA MODELS (PYDANTIC) ==========
+
+# --- REQUEST MODEL ---
 class AuditRequest(BaseModel):
-    '''
-    Defines the expected structure of imcoming API requests.
-    Examples valid request :
-    {"video_url" : "https://youtube.be/abc123"}
-    Invalid : 422 error
-    {"video_url" : 12345}
-    '''
+    """
+    Defines the expected structure of incoming API requests.
+    
+    Pydantic validates that:
+    - The request contains a 'video_url' field
+    - The value is a string (not int, list, etc.)
+    
+    Example valid request:
+    {
+        "video_url": "https://youtu.be/abc123"
+    }
+    
+    Example invalid request (raises 422 error):
+    {
+        "video_url": 12345  ← Not a string!
+    }
+    """
+    video_url: str  # Required string field
 
-    video_url : str
+
+# --- NESTED MODEL ---
+class ComplianceIssue(BaseModel):
+    """
+    Defines the structure of a single compliance violation.
+    
+    Used inside AuditResponse to represent each violation found.
+    """
+    category: str      # Example: "Misleading Claims"
+    severity: str      # Example: "CRITICAL"
+    description: str   # Example: "Absolute guarantee detected at 00:32"
 
 
-class ComoplianceIssue(BaseModel):
-    category : str
-    severity : str
-    description : str
-
-
+# --- RESPONSE MODEL ---
 class AuditResponse(BaseModel):
-    session_id : str
-    video_id : str
-    status : str
-    final_report : str
-    compliance_results : List[ComoplianceIssue]
+    """
+    Defines the structure of API responses.
+    
+    FastAPI uses this to:
+    1. Validate the response before sending (catches bugs)
+    2. Auto-generate API documentation (shows users what to expect)
+    3. Provide type hints for frontend developers
+    
+    Example response:
+    {
+        "session_id": "ce6c43bb-c71a-4f16-a377-8b493502fee2",
+        "video_id": "vid_ce6c43bb",
+        "status": "FAIL",
+        "final_report": "Video contains 2 critical violations...",
+        "compliance_results": [
+            {
+                "category": "Misleading Claims",
+                "severity": "CRITICAL",
+                "description": "Absolute guarantee at 00:32"
+            }
+        ]
+    }
+    """
+    session_id: str                           # Unique audit session ID
+    video_id: str                             # Shortened video identifier
+    status: str                               # PASS or FAIL
+    final_report: str                         # AI-generated summary
+    compliance_results: List[ComplianceIssue] # List of violations (can be empty)
 
 
-# Define the main endpoint
-@app.post("/audit", response_model = AuditRequest)
-async def audit_video(request : AuditRequest):
-    '''
-    Main API endpoint that triggers the compliance audit workflow
-    '''
+# ========== STEP 7: DEFINE MAIN ENDPOINT ==========
+@app.post("/audit", response_model=AuditResponse)
+# ↑ @app.post = Decorator that registers this function as a POST endpoint
+# ↑ "/audit" = URL path (http://localhost:8000/audit)
+# ↑ response_model = Tells FastAPI to validate response matches AuditResponse
 
-    session_id = str(uuid.uuid4())
-    video_id_short = f"vid_{session_id[:8]}"
+async def audit_video(request: AuditRequest):
+    """
+    Main API endpoint that triggers the compliance audit workflow.
+    
+    HTTP Method: POST
+    URL: http://localhost:8000/audit
+    
+    Request Body:
+    {
+        "video_url": "https://youtu.be/abc123"
+    }
+    
+    Response: AuditResponse object (defined above)
+    
+    Process:
+    1. Generate unique session ID
+    2. Prepare input for LangGraph workflow
+    3. Invoke the graph (Indexer → Auditor)
+    4. Return formatted results
+    """
+    
+    # ========== GENERATE SESSION ID ==========
+    session_id = str(uuid.uuid4())  
+    # Creates unique ID like: "ce6c43bb-c71a-4f16-a377-8b493502fee2"
+    
+    video_id_short = f"vid_{session_id[:8]}"  
+    # Takes first 8 characters: "vid_ce6c43bb"
+    # Easier to reference in logs/UI than full UUID
+    
+    # ========== LOG INCOMING REQUEST ==========
+    logger.info(f"Received Audit Request: {request.video_url} (Session: {session_id})")
+    # Example output: "Received Audit Request: https://youtu.be/abc (Session: ce6c43bb...)"
 
-    logger.info(f"Received the Audit Request : {request.video_url} (Session : {session_id})")
-
-    # graph inputs
+    # ========== PREPARE GRAPH INPUT ==========
     initial_inputs = {
-        "video_url" : request.video_url,
-        "video_id" : video_id_short,
-        "compliance_results" : [],
-        "errors" : []
+        "video_url": request.video_url,  # From the API request
+        "video_id": video_id_short,      # Generated ID
+        "compliance_results": [],        # Will be populated by Auditor
+        "errors": []                     # Tracks any processing errors
     }
 
     try:
+        # ========== INVOKE LANGGRAPH WORKFLOW ==========
+        # This is the SAME logic from main.py - just wrapped in an API
         final_state = compliance_graph.invoke(initial_inputs)
+        # ↑ Blocking call - waits for entire workflow to complete
+        # ↑ Flow: START → Indexer → Auditor → END
+        # ↑ Returns: Final state dictionary with all results
+        
+        # NOTE: In production, you'd use:
+        # await compliance_graph.ainvoke(initial_inputs)
+        # ↑ Async version - doesn't block the server while processing
+        
+        # ========== MAP GRAPH OUTPUT TO API RESPONSE ==========
         return AuditResponse(
-            session_id = session_id,
-            video_id = final_state.get("video_id"),
-            status = final_state.get("final_status", "UNKNOWN"),
-            final_report = final_state.get("final_report", "No Report Generated."),
-            compliance_results = final_state.get("compliance_results", [])
+            session_id=session_id,
+            video_id=final_state.get("video_id"),  
+            # .get() safely retrieves value (None if missing)
+            
+            status=final_state.get("final_status", "UNKNOWN"),  
+            # Defaults to "UNKNOWN" if key doesn't exist
+            
+            final_report=final_state.get("final_report", "No report generated."),
+            
+            compliance_results=final_state.get("compliance_results", [])
+            # Returns empty list [] if no violations
         )
-    
+        # FastAPI automatically converts this Pydantic object to JSON
+
     except Exception as e:
-        logger.error(f"Audit Failed : {str(e)}")
+        # ========== ERROR HANDLING ==========
+        logger.error(f"Audit Failed: {str(e)}")  
+        # Log the error for debugging
+        
         raise HTTPException(
-            status_code = 500,
-            detail = f"Workflow Execution Failed : {str(e)}" 
+            status_code=500,  # 500 = Internal Server Error
+            detail=f"Workflow Execution Failed: {str(e)}"
+            # Returns this error message to the client
         )
-    
-# health check endpoint
+        # Example error response:
+        # {
+        #     "detail": "Workflow Execution Failed: YouTube download error"
+        # }
+
+
+# ========== STEP 8: HEALTH CHECK ENDPOINT ==========
 @app.get("/health")
+# ↑ GET request at http://localhost:8000/health
 def health_check():
-    '''
-    Endpoint to verify if API is working or not.
-    '''
-    return {
-        "status" : "healthy",
-        "service" : "Brand Guardian AI"
+    """
+    Simple endpoint to verify the API is running.
+    
+    Used by:
+    - Load balancers (to check if server is alive)
+    - Monitoring systems (uptime checks)
+    - Developers (quick test that server started)
+    
+    Example usage:
+    curl http://localhost:8000/health
+    
+    Response:
+    {
+        "status": "healthy",
+        "service": "Brand Guardian AI"
     }
-
-
-if __name__ == "__main__":
-    uvicorn.run("backend.src.api.server:app", host = "127.0.0.1", port = 8000, reload = True)
+    """
+    return {"status": "healthy", "service": "Brand Guardian AI"}
+    # FastAPI automatically converts dict to JSON response
