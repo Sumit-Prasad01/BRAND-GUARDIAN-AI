@@ -1,55 +1,59 @@
 # Brand Guardian AI
 
-Brand Guardian AI is a Python proof-of-concept for auditing YouTube advertising videos against a curated set of brand, regulatory, and platform rules. It combines video transcription/OCR, retrieval-augmented generation (RAG), and a small LangGraph workflow to produce a compliance status, findings, and a summary report.
+Brand Guardian AI is a Python proof of concept for auditing YouTube advertising videos against brand, regulatory, and platform-compliance guidance. The intended system downloads a video, extracts speech and on-screen text with Azure Video Indexer, retrieves relevant rules from Azure AI Search, and asks Azure OpenAI to return structured compliance findings.
 
-> **Implementation status:** The repository currently contains the workflow design and service integrations, but it is not yet a clean end-to-end runnable release. See [Known implementation gaps](#known-implementation-gaps) before attempting a production deployment.
+## Product flow
 
-## What the project does
+An audit is designed to follow this path:
 
-The intended audit lifecycle is:
+1. A client submits a YouTube URL to the FastAPI API or the CLI scaffold.
+2. The video service downloads the media with `yt-dlp`.
+3. The media is uploaded privately to Azure Video Indexer.
+4. The service polls Video Indexer until processing completes.
+5. Transcript, OCR text, and metadata are placed into the LangGraph state.
+6. The auditor searches the Azure AI Search vector index for relevant compliance rules.
+7. Azure OpenAI receives the retrieved rules and video evidence.
+8. The API returns a status, report, and list of compliance issues.
 
-1. Accept a YouTube URL through the CLI or FastAPI endpoint.
-2. Download the video locally with `yt-dlp`.
-3. Upload it to Azure Video Indexer and wait for processing.
-4. Extract a transcript, OCR text, and basic metadata.
-5. Search the indexed compliance documents in Azure AI Search.
-6. Send the retrieved rules plus the video evidence to an Azure OpenAI chat deployment.
-7. Return structured findings with category, severity, description, status, and a final report.
+The checked-in knowledge-base sources are:
 
-The repository includes two source PDFs used as the intended compliance knowledge base:
-
-- `youtube-ad-specs.pdf`
-- `1001a-influencer-guide-508_1.pdf`
+- `ComplianceQAPipeline/backend/data/youtube-ad-specs.pdf`
+- `ComplianceQAPipeline/backend/data/1001a-influencer-guide-508_1.pdf`
 
 ## Architecture
 
-### System context
+### Target system architecture
 
 ```mermaid
 flowchart LR
-    User[User or client]
-    CLI[CLI runner<br/>main.py]
-    API[FastAPI service\nPOST /audit]
-    Graph[LangGraph audit workflow]
+    Client[Client or operator]
+    API[FastAPI service<br/>GET /health<br/>POST /audit]
+    CLI[CLI scaffold<br/>main.py]
+    Graph[LangGraph workflow]
+    Video[VideoIndexerService]
+    YouTube[YouTube]
     VI[Azure Video Indexer]
-    YT[YouTube]
-    Search[Azure AI Search\nvector index]
-    OpenAI[Azure OpenAI\nchat + embeddings]
-    Rules[PDF compliance rules<br/>backend/data]
-    Monitor[Azure Monitor\nOpenTelemetry]
+    Search[Azure AI Search<br/>vector index]
+    OpenAI[Azure OpenAI<br/>embeddings + chat]
+    PDFs[Compliance PDFs<br/>backend/data]
+    Monitor[Azure Monitor<br/>OpenTelemetry]
 
-    User --> CLI
-    User --> API
+    Client --> API
+    Operator[Operator] --> CLI
     CLI --> Graph
     API --> Graph
-    Graph --> VI
-    VI --> YT
+    Graph --> Video
+    Video --> YouTube
+    Video --> VI
+    VI --> Graph
     Graph --> Search
     Search --> OpenAI
-    Rules -. indexed by .-> Search
     Graph --> OpenAI
+    PDFs -. indexed by .-> Search
     API -. telemetry .-> Monitor
 ```
+
+The diagram describes the intended architecture. In the current source, the LangGraph import path is broken, so the runtime graph is not yet connected successfully.
 
 ### Audit request sequence
 
@@ -57,26 +61,29 @@ flowchart LR
 sequenceDiagram
     autonumber
     participant C as Client
-    participant A as FastAPI / CLI
+    participant A as FastAPI or CLI
     participant G as LangGraph
-    participant V as Video Indexer service
+    participant V as VideoIndexerService
     participant Y as YouTube
+    participant I as Azure Video Indexer
     participant S as Azure AI Search
     participant L as Azure OpenAI
 
     C->>A: Submit video_url
-    A->>G: Initialize VideoAuditedState
+    A->>G: Create VideoAuditState
     G->>V: Download video
-    V->>Y: Fetch YouTube media
-    Y-->>V: Local MP4
-    V->>V: Upload and poll Azure Video Indexer
-    V-->>G: transcript + OCR + metadata
-    G->>S: Similarity search using video evidence
-    S-->>G: Top compliance-rule chunks
-    G->>L: Rules + transcript + OCR + metadata
-    L-->>G: Structured audit result
-    G-->>A: Final status, findings, report
-    A-->>C: Audit response
+    V->>Y: Request media
+    Y-->>V: Local video file
+    V->>I: Upload private video
+    V->>I: Poll processing status
+    I-->>V: Transcript, OCR, metadata
+    V-->>G: Extraction state update
+    G->>S: Similarity search over transcript + OCR
+    S-->>G: Relevant rule chunks
+    G->>L: Rules + evidence + metadata
+    L-->>G: JSON findings and report
+    G-->>A: Final state
+    A-->>C: AuditResponse JSON
 ```
 
 ### LangGraph workflow
@@ -84,28 +91,30 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     Start([START]) --> Indexer[indexer<br/>index_video_node]
-    Indexer -->|transcript, OCR, metadata| Auditor[auditor<br/>audio_content_node]
-    Auditor -->|compliance results, status, report| End([END])
-    Indexer -. failure .-> Fail[errors + FAIL state]
-    Auditor -. missing transcript or LLM/RAG error .-> Fail
+    Indexer -->|transcript, OCR, metadata| Auditor[auditor<br/>audit_content_node]
+    Auditor -->|compliance_results, final_status, final_report| End([END])
+    Indexer -. processing error .-> Error[errors<br/>FAIL state]
+    Auditor -. missing evidence or model error .-> Error
 ```
 
-### Knowledge-base ingestion and RAG path
+The workflow declared in `workflow.py` is linear: `indexer -> auditor -> END`. It has no branching, persistence, retry queue, or background job runner.
+
+### Compliance knowledge-base pipeline
 
 ```mermaid
 flowchart LR
-    PDFs[Compliance PDFs] --> Loader[PyPDFLoader]
-    Loader --> Splitter[Recursive text splitter<br/>chunk 1000 / overlap 200]
-    Splitter --> Embed[Azure OpenAI embeddings]
-    Embed --> Index[Azure AI Search vector index]
+    PDFs[PDF rules] --> Load[PyPDFLoader]
+    Load --> Split[RecursiveCharacterTextSplitter<br/>chunk 1000 / overlap 200]
+    Split --> Embed[Azure OpenAI embeddings]
+    Embed --> Index[Azure AI Search index]
 
-    Evidence[Transcript + OCR text] --> Query[Similarity query]
+    Evidence[Transcript + OCR] --> Query[Similarity query]
     Query --> Index
-    Index --> Chunks[Top 3 rule chunks]
-    Chunks --> Prompt[Audit prompt]
-    Evidence --> Prompt
+    Index --> Rules[Retrieved rule chunks]
+    Evidence --> Prompt[Audit prompt]
+    Rules --> Prompt
     Prompt --> Chat[Azure OpenAI chat deployment]
-    Chat --> Result[JSON findings + final report]
+    Chat --> Output[Structured findings + report]
 ```
 
 ## Repository layout
@@ -116,38 +125,43 @@ flowchart LR
 └── ComplianceQAPipeline/
     ├── main.py                         # CLI-style workflow runner
     ├── pyproject.toml                  # Project metadata; Python >= 3.12
-    ├── requirements.txt                # Runtime and integration dependencies
-    ├── setup.py                         # Legacy setuptools installer
+    ├── requirements.txt                # Runtime dependencies
+    ├── setup.py                         # Legacy setuptools configuration
+    ├── uv.lock                          # uv lockfile
     └── backend/
-        ├── data/                       # Source compliance PDFs
-        ├── dockerfile                  # Empty placeholder at present
+        ├── data/                       # Checked-in PDF compliance sources
+        ├── Dockerfile                  # FastAPI container definition
         ├── scripts/
-        │   └── index_documents.py      # Intended PDF-to-Azure Search indexer
+        │   └── index_documents.py      # PDF-to-Azure AI Search indexer
         └── src/
             ├── api/
-            │   ├── server.py           # FastAPI app and endpoints
-            │   └── telemetry.py        # Azure Monitor setup
+            │   ├── server.py           # FastAPI app and HTTP models
+            │   └── telemetry.py        # Optional Azure Monitor setup
             ├── graph/
-            │   ├── state.py            # LangGraph state schema
-            │   ├── node.py             # Indexer and auditor nodes
-            │   └── workflow.py         # Compiled graph
+            │   ├── __init__.py
+            │   ├── state.py            # VideoAuditState and issue schema
+            │   ├── node.py             # Intended graph node module
+            │   └── workflow.py         # LangGraph construction
             └── services/
-                └── video_indexer.py    # YouTube/Azure Video Indexer connector
+                ├── __init__.py
+                └── video_indexer.py    # YouTube/Azure Video Indexer client
 ```
 
 ## Technology stack
 
-- Python 3.12 or newer
-- FastAPI and Uvicorn for the HTTP API
-- LangGraph for orchestration
-- LangChain for prompts, embeddings, and vector-store access
+- Python 3.12+
+- FastAPI and Uvicorn for HTTP serving
+- LangGraph and LangChain for workflow and retrieval orchestration
 - Azure Video Indexer for transcript and OCR extraction
 - Azure OpenAI for embeddings and compliance reasoning
 - Azure AI Search for the vector knowledge base
-- `yt-dlp` for YouTube download
-- Azure Monitor OpenTelemetry for optional request telemetry
+- `yt-dlp` and FFmpeg for video acquisition/media handling
+- Azure Monitor OpenTelemetry for optional telemetry
+- Docker for container packaging
 
-## Setup
+`streamlit`, Redis, PostgreSQL, SQLAlchemy, Firecrawl, Azure Blob Storage, and LangSmith are listed as dependencies, but no corresponding application modules are currently present in this repository.
+
+## Local setup
 
 From the repository root:
 
@@ -159,51 +173,65 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The application loads a `.env` file from the current working directory. Create `ComplianceQAPipeline/.env` and provide the Azure settings required by the path you are running.
+Create `ComplianceQAPipeline/.env`. `load_dotenv(override=True)` is called by the API, CLI, and indexing script.
 
 ### Environment variables
 
-| Variable | Used by | Required for |
+| Variable | Used by | Purpose |
 | --- | --- | --- |
-| `AZURE_OPENAI_ENDPOINT` | Document indexer | Knowledge-base indexing |
-| `AZURE_OPENAI_API_KEY` | Document indexer | Knowledge-base indexing |
-| `AZURE_OPENAI_CHAT_DEPLOYMENT` | Auditor node | Auditing |
-| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | Document indexer | Indexing; defaults to `text-embedding-3-small` |
-| `AZURE_OPENAI_API_VERSION` | Indexer and auditor | Azure OpenAI calls |
-| `AZURE_SEARCH_ENDPOINT` | Indexer and auditor | RAG retrieval |
-| `AZURE_SEARCH_API_KEY` | Indexer and auditor | RAG retrieval |
-| `AZURE_SEARCH_INDEX_NAME` | Indexer and auditor | RAG retrieval |
-| `AZURE_VI_ACCOUNT_ID` | Video Indexer service | Video processing |
-| `AZURE_VI_LOCATION` | Video Indexer service | Video processing |
-| `AZURE_SUBSCRIPTION_ID` | Video Indexer service | Token generation |
-| `AZURE_RESOURCE_GROUP` | Video Indexer service | Token generation |
-| `AZURE_VI_NAME` | Video Indexer service | Token generation; defaults to `project-brand-guardian-001` |
-| `APPLICATIONINSIGHTS_CONNECTION_STRING` | Telemetry | Optional Azure Monitor telemetry |
+| `AZURE_OPENAI_ENDPOINT` | Indexer | Azure OpenAI resource endpoint |
+| `AZURE_OPENAI_API_KEY` | Indexer | Azure OpenAI authentication |
+| `AZURE_OPENAI_API_VERSION` | Indexer/auditor | API version for Azure OpenAI |
+| `AZURE_OPENAI_CHAT_DEPLOYMENT` | Auditor | Chat model deployment name |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | Indexer | Embedding deployment; defaults to `text-embedding-3-small` |
+| `AZURE_SEARCH_ENDPOINT` | Indexer/auditor | Azure AI Search endpoint |
+| `AZURE_SEARCH_API_KEY` | Indexer/auditor | Azure AI Search authentication |
+| `AZURE_SEARCH_INDEX_NAME` | Indexer/auditor | Vector index name |
+| `AZURE_VI_ACCOUNT_ID` | Video service | Video Indexer account |
+| `AZURE_VI_LOCATION` | Video service | Video Indexer region |
+| `AZURE_SUBSCRIPTION_ID` | Video service | Azure subscription for ARM token exchange |
+| `AZURE_RESOURCE_GROUP` | Video service | Resource group containing the Video Indexer account |
+| `AZURE_VI_NAME` | Video service | Video Indexer resource name; defaults to `project-brand-guardian-001` |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | API telemetry | Optional Azure Monitor connection string |
 
-The Video Indexer connector uses `DefaultAzureCredential`, so local development normally requires an authenticated Azure CLI session, managed identity, or another supported Azure identity source.
+The Video Indexer service uses `DefaultAzureCredential`, so local execution also requires an authenticated Azure CLI session, managed identity, or another supported credential source.
 
-## Knowledge-base indexing
+## Indexing the compliance documents
 
-`backend/scripts/index_documents.py` is intended to load every PDF in `backend/data`, split the text into overlapping chunks, generate embeddings, and upload the chunks to Azure AI Search.
+The indexing script loads all PDFs under `backend/data`, splits them into 1,000-character chunks with 200-character overlap, creates embeddings, and uploads the documents to Azure AI Search.
 
-The intended command is:
+Run it from `ComplianceQAPipeline`:
 
 ```powershell
 python backend/scripts/index_documents.py
 ```
 
-The current script requires fixes before it can successfully complete indexing; details are listed below.
+The Azure Search index and its vector fields must exist or be provisioned in a way supported by the `AzureSearch` LangChain integration before auditing can retrieve rules.
 
-## Running the API
+## API
 
-The API defines:
+### Start the API
 
-| Method | Path | Purpose |
+```powershell
+uvicorn backend.src.api.server:app --host 127.0.0.1 --port 8000 --reload
+```
+
+The Dockerfile uses the container-safe equivalent:
+
+```text
+uvicorn backend.src.api.server:app --host 0.0.0.0 --port 8000
+```
+
+### Endpoints
+
+| Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health` | Returns a basic service health payload |
-| `POST` | `/audit` | Starts an audit for a YouTube URL |
+| `GET` | `/health` | Returns service health information |
+| `POST` | `/audit` | Runs a synchronous video audit |
+| `GET` | `/docs` | FastAPI Swagger UI |
+| `GET` | `/openapi.json` | Generated OpenAPI schema |
 
-Intended request:
+Request:
 
 ```json
 {
@@ -211,86 +239,53 @@ Intended request:
 }
 ```
 
-Intended audit response shape:
+The declared response model is:
 
 ```json
 {
   "session_id": "uuid",
   "video_id": "vid_12345678",
-  "status": "PASS|FAIL",
+  "status": "PASS|FAIL|UNKNOWN",
   "final_report": "Summary of findings...",
   "compliance_results": [
     {
       "category": "Claim Validation",
       "severity": "CRITICAL",
-      "description": "Explanation of the violation"
+      "description": "Explanation of the issue"
     }
   ]
 }
 ```
 
-The intended Uvicorn command is:
+The request is processed synchronously. A real deployment should move video processing to a background worker and return a job identifier.
 
-```powershell
-uvicorn backend.src.api.server:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Because the current code has import-time and integration defects, this command should be treated as the target startup command rather than a guarantee that the present checkout boots successfully.
-
-## Running the CLI
+## CLI scaffold
 
 ```powershell
 python main.py
 ```
 
-`main.py` creates a session and invokes the compiled graph. Its current sample payload contains an empty `video_url`, so it is a scaffold for a future CLI rather than a complete user-facing command-line interface.
+`main.py` creates a UUID-based session and invokes the graph. Its current `video_url` is an empty string, so it is a demonstration runner rather than a complete command-line interface.
 
 ## State model
 
-The LangGraph state is defined in `backend/src/graph/state.py` and is intended to carry:
+`backend/src/graph/state.py` defines:
 
-- Input: `video_url`, `video_id`
-- Extraction: `local_file_path`, `video_metadata`, `transcript`, `ocr_text`
-- Analysis: compliance issues, each with category, description, severity, and optional timestamp
-- Delivery: `final_status`, `final_report`
-- Reliability: accumulated `errors`
+- `ComplianceIssue`: category, description, severity, and optional timestamp.
+- `VideoAuditState`: video input, metadata, transcript, OCR text, accumulated compliance results, final status/report, and accumulated errors.
 
-The workflow is deliberately linear today: indexing must finish before auditing begins. There is no persistence layer, job queue, authentication, retry policy, or asynchronous background execution in the current implementation.
+The `Annotated[..., operator.add]` fields are intended to support append-only updates from graph nodes. The API initializes `video_url`, `video_id`, `compliance_results`, and `errors`; extraction and final result fields are populated during execution.
 
-## Known implementation gaps
+## Container usage
 
-These are visible in the source and should be resolved before describing the service as production-ready:
+Build from the `ComplianceQAPipeline` directory because the Dockerfile copies both `main.py` and `backend/`:
 
-1. `backend/src/graph/node.py` imports and instantiates `VideoIndexerService`, while `backend/src/services/video_indexer.py` defines `VideoIndexer`.
-2. The node calls `extarct_data`, while the service defines `extract_data`.
-3. `upload_video()` does not return the uploaded Azure Video Indexer ID and calls `get_account_token()` without the required ARM token argument.
-4. Video Indexer polling uses an endpoint/response flow that does not clearly target the uploaded video ID.
-5. The auditor writes `final_results`, while the state, CLI, and API read `final_status`.
-6. The FastAPI `/audit` route declares `AuditRequest` as its response model, although it returns an `AuditResponse`.
-7. The compliance issue schema has an optional `timestamp`, but the API response model omits it; the state field is also named `compliance_result` while callers use `compliance_results`.
-8. Several logging calls pass `logging.info` instead of a numeric logging level.
-9. `backend/scripts/index_documents.py` contains undefined variables and misspelled Azure Search keyword arguments, including `index_name`, `azure_saerch_endpoint`, and `embeddings_function`.
-10. The document indexer computes its data path relative to `backend/scripts`, but the resulting path should be verified against the actual `backend/data` location.
-11. `backend/dockerfile` is empty, and there is no test suite, CI configuration, API authentication, or deployment manifest.
-12. `streamlit` is listed as a dependency, but no Streamlit application exists in the repository.
+```powershell
+cd ComplianceQAPipeline
+docker build -f backend/Dockerfile -t brand-guardian-ai:local .
+docker run --rm -p 8000:8000 --env-file .env brand-guardian-ai:local
+```
 
-## Security and operational notes
+The image is based on `python:3.12-slim`, installs FFmpeg, runs as a non-root `appuser`, exposes port `8000`, and checks `/health`. The container still depends on valid Azure credentials and configuration supplied at runtime.
 
-- Do not commit `.env` files, API keys, downloaded videos, or Azure credentials.
-- Keep uploaded videos private in Azure Video Indexer, as the current connector requests private indexing.
-- Validate and constrain accepted URLs before enabling this service for untrusted callers.
-- Add request authentication, rate limiting, size/time limits, retries with backoff, and cleanup guarantees before exposing `/audit` publicly.
-- Treat LLM output as untrusted input: validate it against a strict schema and retain the raw response only under an appropriate data-retention policy.
-- Video processing is synchronous and may take several minutes; a production API should hand work to a background queue and expose job status.
-
-## Suggested next steps
-
-1. Make the service and node names consistent and fix the Video Indexer token/upload/polling flow.
-2. Repair the state/result naming mismatch and validate LLM output with Pydantic.
-3. Correct the document-indexing script and build the Azure AI Search index from the checked-in PDFs.
-4. Add unit tests for state transitions, parsing, failure paths, and API contracts.
-5. Add a real container image, secrets configuration, authentication, asynchronous jobs, and CI/CD.
-
-## License
-
-No license file is currently included in the repository.
+---
